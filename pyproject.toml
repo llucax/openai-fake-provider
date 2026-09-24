@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openai-fake-provider"
+version = "0.1.0"
+description = "Fake OpenAI-compatible LLM provider for inspecting what clients send"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+openai-fake-provider = "openai_fake_provider:main"
+
+[tool.setuptools]
+py-modules = ["openai_fake_provider"]
+
+[tool.ruff]
+line-length = 100
