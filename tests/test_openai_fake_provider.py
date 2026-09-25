@@ -115,6 +115,15 @@ class AnalyzeTest(unittest.TestCase):
         self.assertIn("extra", report)
 
 
+class CliTest(unittest.TestCase):
+    def test_serve_does_not_dump_by_default(self) -> None:
+        self.assertIsNone(fake.build_parser().parse_args(["serve"]).dump_dir)
+
+    def test_serve_dump_dir(self) -> None:
+        args = fake.build_parser().parse_args(["serve", "--dump-dir", "x"])
+        self.assertEqual(args.dump_dir, Path("x"))
+
+
 class ServerTest(unittest.TestCase):
     def setUp(self) -> None:
         temp = tempfile.TemporaryDirectory()

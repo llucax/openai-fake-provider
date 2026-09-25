@@ -697,7 +697,7 @@ def load_request(path: str) -> dict[str, Any]:
     return json.loads(text)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Fake OpenAI-compatible LLM provider for inspecting what clients send."
     )
@@ -709,10 +709,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     serve.add_argument(
         "--dump-dir",
         type=Path,
-        default=Path("requests"),
-        help="where to save request bodies (default: ./requests)",
+        metavar="DIR",
+        help="save request bodies to DIR (default: not saved, since they contain full "
+        "prompts, which are private)",
     )
-    serve.add_argument("--no-dump", action="store_true", help="do not save requests")
 
     stats = commands.add_parser("stats", help="size breakdown of a saved request")
     stats.add_argument("file", help="request JSON file, or - for stdin")
@@ -740,15 +740,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         "uses the system prompt it would use for that model",
     )
 
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
     match args.command:
         case "serve":
-            dump_dir = None if args.no_dump else args.dump_dir
+            dump_dir = args.dump_dir
             server = make_server(args.host, args.port, dump_dir)
             host, port = server.server_address[:2]
             print(
                 f"serving http://{host}:{port}/v1, models: {', '.join(MODELS)}"
-                + (f", saving requests to {dump_dir}/" if dump_dir else ""),
+                + (
+                    f", saving requests to {dump_dir}/"
+                    if dump_dir
+                    else ", not saving requests (use --dump-dir to save them)"
+                ),
                 file=sys.stderr,
                 flush=True,
             )

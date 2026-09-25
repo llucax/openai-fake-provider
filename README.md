@@ -1,7 +1,7 @@
 # openai-fake-provider
 
-A fake LLM provider that speaks the OpenAI Chat Completions API, saves every
-request it receives and answers without calling any real model. It is meant for
+A fake LLM provider that speaks the OpenAI Chat Completions API, answers without
+calling any real model and can save every request it receives. It is meant for
 seeing exactly what a client sends: how big the system prompt is, which tools
 it declares and how much each one costs, and how a tool result changes the
 next request. The main target is [opencode](https://opencode.ai), to measure how
@@ -42,11 +42,19 @@ final answer is the breakdown of the request that carries all the tool results.
 
 ## Saved requests
 
-Each request body is written to `requests/NNNN-<kind>.json` (change the
-directory with `--dump-dir`, or disable it with `--no-dump`). The kind is
+Requests are not saved by default, because they contain the full prompts,
+which are private. Pass `--dump-dir DIR` to `serve` and each request body is
+written to `DIR/NNNN-<kind>.json`. A temporary directory keeps them from
+piling up somewhere they could be shared by accident:
+
+```sh
+./openai_fake_provider.py serve --dump-dir "$(mktemp -d)"
+```
+
+The kind is
 `prompt` when the last message is from the user, `tool-result` when it is a
 tool result, and `title` for opencode's title generation. Numbering continues
-across restarts. The server also logs a one-line summary of each request to
+across restarts that reuse the same directory. The server also logs a one-line summary of each request to
 stderr.
 
 Three commands work on saved requests:
@@ -62,7 +70,9 @@ per token, a rough estimate that real tokenizers can be quite far from.
 
 ## Using it with opencode
 
-Start the server, which listens on `127.0.0.1:4141` by default:
+Start the server, which listens on `127.0.0.1:4141` by default. The models
+answer without saving anything, so only pass `--dump-dir` when you want the
+requests on disk, for example to compare them later:
 
 ```sh
 ./openai_fake_provider.py serve
@@ -81,10 +91,14 @@ opencode -m fake/echo     # the TUI works too
 ```
 
 To measure what something adds, save a request with and without it and compare
-them:
+them. Start the server with a temporary dump directory, then compare two of the
+files in it:
 
 ```sh
-./openai_fake_provider.py compare requests/0002-prompt.json requests/0005-prompt.json
+dump=$(mktemp -d)
+./openai_fake_provider.py serve --dump-dir "$dump"
+# ...run opencode twice, then:
+./openai_fake_provider.py compare "$dump/0002-prompt.json" "$dump/0005-prompt.json"
 ```
 
 ### Things to keep in mind
