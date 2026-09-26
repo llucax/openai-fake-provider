@@ -1,0 +1,16 @@
+{
+  "name": "openai-fake-provider-opencode",
+  "private": true,
+  "type": "module",
+  "description": "opencode plugin that adds the fake provider and starts its server when needed",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test *.test.ts",
+    "check": "npm run typecheck && npm test"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "1.18.32",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.7.0"
+  }
+}
