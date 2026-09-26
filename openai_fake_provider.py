@@ -21,11 +21,13 @@ Only the standard library is used, so the file runs anywhere with Python 3.11+.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import difflib
 import errno
 import ipaddress
 import json
+import math
 import re
 import sys
 import threading
@@ -534,6 +536,25 @@ class FakeServer(ThreadingHTTPServer):
     def __init__(self, address: tuple[str, int], dump_dir: Path | None) -> None:
         super().__init__(address, Handler)
         self.dumpers = Dumpers(dump_dir)
+        self._activity_lock = threading.Lock()
+        self._active = 0
+        self._last_activity = time.monotonic()
+
+    @contextlib.contextmanager
+    def activity(self) -> Iterator[None]:
+        """Mark a request as in progress, so the server isn't idle meanwhile."""
+        with self._activity_lock:
+            self._active += 1
+        try:
+            yield
+        finally:
+            with self._activity_lock:
+                self._active -= 1
+                self._last_activity = time.monotonic()
+
+    def idle_seconds(self) -> float:
+        with self._activity_lock:
+            return 0.0 if self._active else time.monotonic() - self._last_activity
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -544,7 +565,19 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         pass  # Requests are logged by handle_chat, in a more useful form.
 
+    # Activity starts once a request line is in, not in handle_one_request:
+    # that also waits for the next request on a kept-alive connection, which
+    # an idle client can hold open forever.
+
     def do_GET(self) -> None:
+        with self.server.activity():
+            self.handle_get()
+
+    def do_POST(self) -> None:
+        with self.server.activity():
+            self.handle_post()
+
+    def handle_get(self) -> None:
         if self.path.rstrip("/") in ("/v1/models", "/models"):
             self.send_json(
                 {
@@ -558,7 +591,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_error_json(HTTPStatus.NOT_FOUND, f"no route for GET {self.path}")
 
-    def do_POST(self) -> None:
+    def handle_post(self) -> None:
         if self.path.rstrip("/") not in ("/v1/chat/completions", "/chat/completions"):
             self.send_error_json(HTTPStatus.NOT_FOUND, f"no route for POST {self.path}")
             return
@@ -725,6 +758,26 @@ def make_server(host: str, port: int, dump_dir: Path | None) -> FakeServer:
     return FakeServer((host, port), dump_dir)
 
 
+def exit_when_idle(server: FakeServer, idle_seconds: float) -> threading.Thread:
+    """Shut the server down once no request has come for `idle_seconds`.
+
+    Any request counts, including `GET /v1/models`, which the opencode
+    plugin sends before each request it lets through.
+    """
+
+    def watch() -> None:
+        while (remaining := idle_seconds - server.idle_seconds()) > 0:
+            time.sleep(remaining)
+        print(
+            f"no requests for {idle_seconds / 60:g} minutes, exiting", file=sys.stderr, flush=True
+        )
+        server.shutdown()
+
+    thread = threading.Thread(target=watch, name="idle-exit", daemon=True)
+    thread.start()
+    return thread
+
+
 # opencode integration
 
 
@@ -774,6 +827,13 @@ def load_request(path: str) -> dict[str, Any]:
     return json.loads(text)
 
 
+def positive_float(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        raise argparse.ArgumentTypeError(f"must be greater than 0, got {value}")
+    return number
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Fake OpenAI-compatible LLM provider for inspecting what clients send."
@@ -783,6 +843,12 @@ def build_parser() -> argparse.ArgumentParser:
     serve = commands.add_parser("serve", help="run the fake provider")
     serve.add_argument("--host", default=DEFAULT_HOST)
     serve.add_argument("--port", type=int, default=DEFAULT_PORT)
+    serve.add_argument(
+        "--idle-exit",
+        type=positive_float,
+        metavar="MINUTES",
+        help="exit after MINUTES without any request (default: never)",
+    )
     serve.add_argument(
         "--dump-dir",
         type=Path,
@@ -840,10 +906,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f", saving requests to {dump_dir}/"
                     if dump_dir
                     else ", not saving requests (use --dump-dir to save them)"
-                ),
+                )
+                + (f", exiting after {args.idle_exit:g} idle minutes" if args.idle_exit else ""),
                 file=sys.stderr,
                 flush=True,
             )
+            if args.idle_exit:
+                exit_when_idle(server, args.idle_exit * 60)
             try:
                 server.serve_forever()
             except KeyboardInterrupt:

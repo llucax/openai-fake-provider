@@ -5,8 +5,10 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import socket
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -125,6 +127,43 @@ class CliTest(unittest.TestCase):
     def test_serve_dump_dir(self) -> None:
         args = fake.build_parser().parse_args(["serve", "--dump-dir", "x"])
         self.assertEqual(args.dump_dir, Path("x"))
+
+    def test_serve_idle_exit(self) -> None:
+        self.assertIsNone(fake.build_parser().parse_args(["serve"]).idle_exit)
+        args = fake.build_parser().parse_args(["serve", "--idle-exit", "1.5"])
+        self.assertEqual(args.idle_exit, 1.5)
+        for invalid in ("0", "-1", "nan", "inf"):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                fake.build_parser().parse_args(["serve", "--idle-exit", invalid])
+
+
+class IdleExitTest(unittest.TestCase):
+    def test_exits_only_after_idle(self) -> None:
+        server = fake.make_server("127.0.0.1", 0, None)
+        self.addCleanup(server.server_close)
+        serving = threading.Thread(target=server.serve_forever, daemon=True)
+        serving.start()
+        url = f"http://127.0.0.1:{server.server_address[1]}/v1/models"
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            fake.exit_when_idle(server, 0.6)
+            for _ in range(3):  # 0.9 s in all, but never 0.6 s idle
+                time.sleep(0.3)
+                urllib.request.urlopen(url).close()
+            # A kept-alive connection waiting for its next request is idle.
+            idle_client = socket.create_connection(server.server_address)
+            self.addCleanup(idle_client.close)
+            self.assertTrue(serving.is_alive())
+            serving.join(timeout=3)
+        self.assertFalse(serving.is_alive())
+        self.assertIn("no requests for 0.01 minutes, exiting", stderr.getvalue())
+
+    def test_request_in_progress_is_not_idle(self) -> None:
+        server = fake.make_server("127.0.0.1", 0, None)
+        self.addCleanup(server.server_close)
+        with server.activity():
+            time.sleep(0.05)
+            self.assertEqual(server.idle_seconds(), 0)
+        self.assertLess(server.idle_seconds(), 0.05)
 
 
 class ServerTest(unittest.TestCase):
