@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import tempfile
 import threading
@@ -210,7 +212,15 @@ class ServerTest(unittest.TestCase):
     def test_models(self) -> None:
         with urllib.request.urlopen(self.url + "/models") as response:
             ids = [m["id"] for m in json.load(response)["data"]]
+            server = response.headers["Server"]
         self.assertEqual(ids, list(fake.MODELS))
+        self.assertTrue(server.startswith(f"openai-fake-provider/{fake.__version__} "))
+
+    def test_serve_on_a_used_port(self) -> None:
+        port = str(self.server.server_address[1])
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            self.assertEqual(fake.main(["serve", "--port", port]), 1)
+        self.assertEqual(stderr.getvalue(), f"127.0.0.1:{port} is already in use\n")
 
 
 if __name__ == "__main__":

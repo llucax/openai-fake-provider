@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import difflib
+import errno
 import ipaddress
 import json
 import re
@@ -35,6 +36,8 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+
+__version__ = "0.1.0"
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 4141
@@ -534,7 +537,7 @@ class FakeServer(ThreadingHTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "openai-fake-provider"
+    server_version = f"openai-fake-provider/{__version__}"
     protocol_version = "HTTP/1.1"
     server: FakeServer
 
@@ -823,7 +826,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     match args.command:
         case "serve":
             dump_dir = args.dump_dir
-            server = make_server(args.host, args.port, dump_dir)
+            try:
+                server = make_server(args.host, args.port, dump_dir)
+            except OSError as error:
+                if error.errno != errno.EADDRINUSE:
+                    raise
+                print(f"{args.host}:{args.port} is already in use", file=sys.stderr)
+                return 1
             host, port = server.server_address[:2]
             print(
                 f"serving http://{host}:{port}/v1, models: {', '.join(MODELS)}"

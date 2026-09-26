@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openai-fake-provider"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Fake OpenAI-compatible LLM provider for inspecting what clients send"
 readme = "README.md"
 license = "MIT"
@@ -17,6 +17,9 @@ openai-fake-provider = "openai_fake_provider:main"
 
 [tool.setuptools]
 py-modules = ["openai_fake_provider"]
+
+[tool.setuptools.dynamic]
+version = { attr = "openai_fake_provider.__version__" }
 
 [tool.ruff]
 line-length = 100
