@@ -57,6 +57,13 @@ tool result, and `title` for opencode's title generation. Numbering continues
 across restarts that reuse the same directory. The server also logs a one-line summary of each request to
 stderr.
 
+A client can also pick the directory per request, with an
+`X-Fake-Provider-Dump-Dir` header holding an absolute path. That request is
+saved there instead, whatever `--dump-dir` says, and each directory is
+numbered on its own. The header is only accepted from loopback clients. The
+`stats` model's answer ends with `saved as <path>` whenever the request was
+saved, so the caller knows which file to compare later.
+
 Three commands work on saved requests:
 
 - `stats FILE` prints the same breakdown as the `stats` model.

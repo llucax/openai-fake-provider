@@ -6,6 +6,7 @@ import json
 import tempfile
 import threading
 import unittest
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -137,14 +138,17 @@ class ServerTest(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
 
-    def post(self, body: dict[str, Any]) -> bytes:
+    def post(self, body: dict[str, Any], headers: dict[str, str] | None = None) -> bytes:
         request = urllib.request.Request(
             self.url + "/chat/completions",
             data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", **(headers or {})},
         )
         with urllib.request.urlopen(request) as response:
             return response.read()
+
+    def answer(self, body: dict[str, Any], headers: dict[str, str] | None = None) -> str:
+        return json.loads(self.post(body, headers))["choices"][0]["message"]["content"]
 
     def test_stream_tool_call_and_dump(self) -> None:
         raw = self.post(dict(chat(user('CALL skill {"name": "a"}')), stream=True)).decode()
@@ -165,6 +169,43 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(
             json.loads(text.removeprefix("```json\n").removesuffix("\n```")), chat(user("hi"))
         )
+
+    def test_dump_dir_per_request(self) -> None:
+        with tempfile.TemporaryDirectory() as other:
+            header = {fake.DUMP_DIR_HEADER: other}
+            self.post(chat(user("a"), model="ok"))
+            self.post(chat(user("b"), model="ok"), header)
+            text = self.answer(chat(user("c"), model="stats"), header)
+
+            self.assertEqual(sorted(p.name for p in self.dump_dir.iterdir()), ["0001-prompt.json"])
+            self.assertEqual(
+                sorted(p.name for p in Path(other).iterdir()),
+                ["0001-prompt.json", "0002-prompt.json"],
+            )
+            self.assertTrue(text.endswith(f"\n\nsaved as {Path(other) / '0002-prompt.json'}"))
+
+    def test_dump_dir_header_naming_the_default(self) -> None:
+        self.post(chat(user("a"), model="ok"))
+        self.post(chat(user("b"), model="ok"), {fake.DUMP_DIR_HEADER: str(self.dump_dir)})
+        self.post(chat(user("c"), model="ok"))
+        self.assertEqual(
+            sorted(p.name for p in self.dump_dir.iterdir()),
+            ["0001-prompt.json", "0002-prompt.json", "0003-prompt.json"],
+        )
+
+    def test_dump_dir_must_be_absolute(self) -> None:
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self.post(chat(user("a")), {fake.DUMP_DIR_HEADER: "relative"})
+        self.assertEqual(caught.exception.code, 400)
+        self.assertIn("absolute path", caught.exception.read().decode())
+
+    def test_stats_without_dump_has_no_footer(self) -> None:
+        server = fake.make_server("127.0.0.1", 0, None)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.url = f"http://127.0.0.1:{server.server_address[1]}/v1"
+        self.assertNotIn("saved as", self.answer(chat(user("a"), model="stats")))
 
     def test_models(self) -> None:
         with urllib.request.urlopen(self.url + "/models") as response:
