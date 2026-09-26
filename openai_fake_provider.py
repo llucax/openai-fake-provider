@@ -39,11 +39,14 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 4141
 DEFAULT_PROVIDER_ID = "fake"
 
+PROVIDER_NAME = "FakeAI"
+"""Display name of the provider in the opencode config."""
+
 MODELS = {
-    "echo": "Echo (full request JSON)",
-    "render": "Render (request as readable text)",
-    "stats": "Stats (request size breakdown)",
-    "ok": "OK (fixed short reply)",
+    "echo": "Echo JSON",
+    "render": "Echo Markdown",
+    "stats": "Stats",
+    "ok": "OK",
 }
 """Model IDs served, with the display name used in the opencode config."""
 
@@ -668,7 +671,7 @@ def opencode_config(base_url: str, provider_id: str, mimic: str | None = None) -
         "small_model": f"{provider_id}/ok",
         "provider": {
             provider_id: {
-                "name": "Fake (openai-fake-provider)",
+                "name": PROVIDER_NAME,
                 "npm": "@ai-sdk/openai-compatible",
                 "options": {"baseURL": base_url, "apiKey": "fake"},
                 "models": {
