@@ -21,9 +21,13 @@ Only the standard library is used, so the file runs anywhere with Python 3.11+.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import difflib
+import errno
+import ipaddress
 import json
+import math
 import re
 import sys
 import threading
@@ -35,15 +39,20 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+__version__ = "0.1.0"
+
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 4141
 DEFAULT_PROVIDER_ID = "fake"
 
+PROVIDER_NAME = "FakeAI"
+"""Display name of the provider in the opencode config."""
+
 MODELS = {
-    "echo": "Echo (full request JSON)",
-    "render": "Render (request as readable text)",
-    "stats": "Stats (request size breakdown)",
-    "ok": "OK (fixed short reply)",
+    "echo": "Echo JSON",
+    "render": "Echo Markdown",
+    "stats": "Stats",
+    "ok": "OK",
 }
 """Model IDs served, with the display name used in the opencode config."""
 
@@ -57,6 +66,12 @@ CHARS_PER_TOKEN = 4
 """Rough ratio used for token estimates; real tokenizers differ by model."""
 
 STREAM_CHUNK_CHARS = 2048
+
+DUMP_DIR_HEADER = "X-Fake-Provider-Dump-Dir"
+"""Request header naming the directory to save that request to.
+
+Only honored for loopback clients, and only with an absolute path.
+"""
 
 
 # Request inspection
@@ -369,8 +384,12 @@ class Reply:
     tool_calls: tuple[ToolCall, ...] = ()
 
 
-def plan_reply(request: dict[str, Any], model: str) -> Reply:
-    """Decide what the fake model answers to a request."""
+def plan_reply(request: dict[str, Any], model: str, saved: Path | None = None) -> Reply:
+    """Decide what the fake model answers to a request.
+
+    `saved` is where the request was saved, if it was; the `stats` answer
+    ends with it, so the caller knows which file to compare later.
+    """
     messages = request.get("messages") or []
     if is_title_request(messages):
         return Reply(text=title_for(messages))
@@ -387,7 +406,7 @@ def plan_reply(request: dict[str, Any], model: str) -> Reply:
         if done < len(directives):
             return call_reply(directives[done])
 
-    return Reply(text=answer_text(request, model))
+    return Reply(text=answer_text(request, model, saved))
 
 
 def unquote(text: str) -> str:
@@ -443,12 +462,13 @@ def reply_mode(model: str) -> str:
     return next((word for word in reversed(words) if word in MODELS), "echo")
 
 
-def answer_text(request: dict[str, Any], model: str) -> str:
+def answer_text(request: dict[str, Any], model: str, saved: Path | None = None) -> str:
     match reply_mode(model):
         case "ok":
             return "ok"
         case "stats":
-            return "```\n" + format_stats(analyze(request)) + "\n```"
+            footer = f"\n\nsaved as {saved}" if saved else ""
+            return "```\n" + format_stats(analyze(request)) + "\n```" + footer
         case "render":
             return render(request)
         case _:
@@ -481,20 +501,83 @@ class Dumper:
             self._next += 1
         if self._directory is None:
             return number, None
+        self._directory.mkdir(parents=True, exist_ok=True)
         path = self._directory / f"{number:04d}-{kind}.json"
         path.write_text(json.dumps(request, indent=2, ensure_ascii=False) + "\n")
         return number, path
 
 
+class Dumpers:
+    """One `Dumper` per directory, so each directory is numbered on its own.
+
+    Requests without a directory of their own go to the default one, given
+    with `--dump-dir`, or are not saved when there is none.
+    """
+
+    def __init__(self, default: Path | None) -> None:
+        self._default = Dumper(default)
+        # The default directory can come back in a header too, and must keep
+        # a single numbering, or two requests would get the same file name.
+        self._by_directory = {default.resolve(): self._default} if default else {}
+        self._lock = threading.Lock()
+
+    def get(self, directory: Path | None) -> Dumper:
+        if directory is None:
+            return self._default
+        key = directory.resolve()
+        with self._lock:
+            dumper = self._by_directory.get(key)
+            if dumper is None:
+                dumper = self._by_directory[key] = Dumper(directory)
+            return dumper
+
+
+class FakeServer(ThreadingHTTPServer):
+    def __init__(self, address: tuple[str, int], dump_dir: Path | None) -> None:
+        super().__init__(address, Handler)
+        self.dumpers = Dumpers(dump_dir)
+        self._activity_lock = threading.Lock()
+        self._active = 0
+        self._last_activity = time.monotonic()
+
+    @contextlib.contextmanager
+    def activity(self) -> Iterator[None]:
+        """Mark a request as in progress, so the server isn't idle meanwhile."""
+        with self._activity_lock:
+            self._active += 1
+        try:
+            yield
+        finally:
+            with self._activity_lock:
+                self._active -= 1
+                self._last_activity = time.monotonic()
+
+    def idle_seconds(self) -> float:
+        with self._activity_lock:
+            return 0.0 if self._active else time.monotonic() - self._last_activity
+
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = "openai-fake-provider"
+    server_version = f"openai-fake-provider/{__version__}"
     protocol_version = "HTTP/1.1"
-    dumper: Dumper
+    server: FakeServer
 
     def log_message(self, format: str, *args: Any) -> None:
         pass  # Requests are logged by handle_chat, in a more useful form.
 
+    # Activity starts once a request line is in, not in handle_one_request:
+    # that also waits for the next request on a kept-alive connection, which
+    # an idle client can hold open forever.
+
     def do_GET(self) -> None:
+        with self.server.activity():
+            self.handle_get()
+
+    def do_POST(self) -> None:
+        with self.server.activity():
+            self.handle_post()
+
+    def handle_get(self) -> None:
         if self.path.rstrip("/") in ("/v1/models", "/models"):
             self.send_json(
                 {
@@ -508,7 +591,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_error_json(HTTPStatus.NOT_FOUND, f"no route for GET {self.path}")
 
-    def do_POST(self) -> None:
+    def handle_post(self) -> None:
         if self.path.rstrip("/") not in ("/v1/chat/completions", "/chat/completions"):
             self.send_error_json(HTTPStatus.NOT_FOUND, f"no route for POST {self.path}")
             return
@@ -518,14 +601,35 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError as error:
             self.send_error_json(HTTPStatus.BAD_REQUEST, f"invalid JSON body: {error}")
             return
-        self.handle_chat(request)
+        try:
+            dump_dir = self.requested_dump_dir()
+        except ValueError as error:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, str(error))
+            return
+        self.handle_chat(request, dump_dir)
 
-    def handle_chat(self, request: dict[str, Any]) -> None:
+    def requested_dump_dir(self) -> Path | None:
+        """Return the directory the client asked to save this request to."""
+        value = self.headers.get(DUMP_DIR_HEADER)
+        if not value:
+            return None
+        if not is_loopback(self.client_address[0]):
+            raise ValueError(f"{DUMP_DIR_HEADER} is only accepted from loopback clients")
+        directory = Path(value)
+        if not directory.is_absolute():
+            raise ValueError(f"{DUMP_DIR_HEADER} must be an absolute path, got {value!r}")
+        return directory
+
+    def handle_chat(self, request: dict[str, Any], dump_dir: Path | None = None) -> None:
         model = str(request.get("model", "echo"))
         kind = request_kind(request)
-        number, path = self.dumper.dump(request, kind)
+        try:
+            number, path = self.server.dumpers.get(dump_dir).dump(request, kind)
+        except OSError as error:
+            self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, f"cannot save request: {error}")
+            return
         stats = analyze(request)
-        reply = plan_reply(request, model)
+        reply = plan_reply(request, model, path)
         outcome = (
             "call " + ", ".join(f"{c.name} {c.arguments}" for c in reply.tool_calls)
             if reply.tool_calls
@@ -579,6 +683,13 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             print("client disconnected mid-stream", file=sys.stderr)
+
+
+def is_loopback(host: str) -> bool:
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def stream_chunks(
@@ -643,9 +754,28 @@ def completion(
     }
 
 
-def make_server(host: str, port: int, dump_dir: Path | None) -> ThreadingHTTPServer:
-    handler = type("BoundHandler", (Handler,), {"dumper": Dumper(dump_dir)})
-    return ThreadingHTTPServer((host, port), handler)
+def make_server(host: str, port: int, dump_dir: Path | None) -> FakeServer:
+    return FakeServer((host, port), dump_dir)
+
+
+def exit_when_idle(server: FakeServer, idle_seconds: float) -> threading.Thread:
+    """Shut the server down once no request has come for `idle_seconds`.
+
+    Any request counts, including `GET /v1/models`, which the opencode
+    plugin sends before each request it lets through.
+    """
+
+    def watch() -> None:
+        while (remaining := idle_seconds - server.idle_seconds()) > 0:
+            time.sleep(remaining)
+        print(
+            f"no requests for {idle_seconds / 60:g} minutes, exiting", file=sys.stderr, flush=True
+        )
+        server.shutdown()
+
+    thread = threading.Thread(target=watch, name="idle-exit", daemon=True)
+    thread.start()
+    return thread
 
 
 # opencode integration
@@ -668,7 +798,7 @@ def opencode_config(base_url: str, provider_id: str, mimic: str | None = None) -
         "small_model": f"{provider_id}/ok",
         "provider": {
             provider_id: {
-                "name": "Fake (openai-fake-provider)",
+                "name": PROVIDER_NAME,
                 "npm": "@ai-sdk/openai-compatible",
                 "options": {"baseURL": base_url, "apiKey": "fake"},
                 "models": {
@@ -697,6 +827,13 @@ def load_request(path: str) -> dict[str, Any]:
     return json.loads(text)
 
 
+def positive_float(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        raise argparse.ArgumentTypeError(f"must be greater than 0, got {value}")
+    return number
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Fake OpenAI-compatible LLM provider for inspecting what clients send."
@@ -707,11 +844,18 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--host", default=DEFAULT_HOST)
     serve.add_argument("--port", type=int, default=DEFAULT_PORT)
     serve.add_argument(
+        "--idle-exit",
+        type=positive_float,
+        metavar="MINUTES",
+        help="exit after MINUTES without any request (default: never)",
+    )
+    serve.add_argument(
         "--dump-dir",
         type=Path,
         metavar="DIR",
         help="save request bodies to DIR (default: not saved, since they contain full "
-        "prompts, which are private)",
+        f"prompts, which are private); a request with a {DUMP_DIR_HEADER} header is saved "
+        "to the directory it names instead",
     )
 
     stats = commands.add_parser("stats", help="size breakdown of a saved request")
@@ -748,7 +892,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     match args.command:
         case "serve":
             dump_dir = args.dump_dir
-            server = make_server(args.host, args.port, dump_dir)
+            try:
+                server = make_server(args.host, args.port, dump_dir)
+            except OSError as error:
+                if error.errno != errno.EADDRINUSE:
+                    raise
+                print(f"{args.host}:{args.port} is already in use", file=sys.stderr)
+                return 1
             host, port = server.server_address[:2]
             print(
                 f"serving http://{host}:{port}/v1, models: {', '.join(MODELS)}"
@@ -756,10 +906,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f", saving requests to {dump_dir}/"
                     if dump_dir
                     else ", not saving requests (use --dump-dir to save them)"
-                ),
+                )
+                + (f", exiting after {args.idle_exit:g} idle minutes" if args.idle_exit else ""),
                 file=sys.stderr,
                 flush=True,
             )
+            if args.idle_exit:
+                exit_when_idle(server, args.idle_exit * 60)
             try:
                 server.serve_forever()
             except KeyboardInterrupt:

@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
+import socket
 import tempfile
 import threading
+import time
 import unittest
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -123,6 +128,43 @@ class CliTest(unittest.TestCase):
         args = fake.build_parser().parse_args(["serve", "--dump-dir", "x"])
         self.assertEqual(args.dump_dir, Path("x"))
 
+    def test_serve_idle_exit(self) -> None:
+        self.assertIsNone(fake.build_parser().parse_args(["serve"]).idle_exit)
+        args = fake.build_parser().parse_args(["serve", "--idle-exit", "1.5"])
+        self.assertEqual(args.idle_exit, 1.5)
+        for invalid in ("0", "-1", "nan", "inf"):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                fake.build_parser().parse_args(["serve", "--idle-exit", invalid])
+
+
+class IdleExitTest(unittest.TestCase):
+    def test_exits_only_after_idle(self) -> None:
+        server = fake.make_server("127.0.0.1", 0, None)
+        self.addCleanup(server.server_close)
+        serving = threading.Thread(target=server.serve_forever, daemon=True)
+        serving.start()
+        url = f"http://127.0.0.1:{server.server_address[1]}/v1/models"
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            fake.exit_when_idle(server, 0.6)
+            for _ in range(3):  # 0.9 s in all, but never 0.6 s idle
+                time.sleep(0.3)
+                urllib.request.urlopen(url).close()
+            # A kept-alive connection waiting for its next request is idle.
+            idle_client = socket.create_connection(server.server_address)
+            self.addCleanup(idle_client.close)
+            self.assertTrue(serving.is_alive())
+            serving.join(timeout=3)
+        self.assertFalse(serving.is_alive())
+        self.assertIn("no requests for 0.01 minutes, exiting", stderr.getvalue())
+
+    def test_request_in_progress_is_not_idle(self) -> None:
+        server = fake.make_server("127.0.0.1", 0, None)
+        self.addCleanup(server.server_close)
+        with server.activity():
+            time.sleep(0.05)
+            self.assertEqual(server.idle_seconds(), 0)
+        self.assertLess(server.idle_seconds(), 0.05)
+
 
 class ServerTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -137,14 +179,17 @@ class ServerTest(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
 
-    def post(self, body: dict[str, Any]) -> bytes:
+    def post(self, body: dict[str, Any], headers: dict[str, str] | None = None) -> bytes:
         request = urllib.request.Request(
             self.url + "/chat/completions",
             data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", **(headers or {})},
         )
         with urllib.request.urlopen(request) as response:
             return response.read()
+
+    def answer(self, body: dict[str, Any], headers: dict[str, str] | None = None) -> str:
+        return json.loads(self.post(body, headers))["choices"][0]["message"]["content"]
 
     def test_stream_tool_call_and_dump(self) -> None:
         raw = self.post(dict(chat(user('CALL skill {"name": "a"}')), stream=True)).decode()
@@ -166,10 +211,55 @@ class ServerTest(unittest.TestCase):
             json.loads(text.removeprefix("```json\n").removesuffix("\n```")), chat(user("hi"))
         )
 
+    def test_dump_dir_per_request(self) -> None:
+        with tempfile.TemporaryDirectory() as other:
+            header = {fake.DUMP_DIR_HEADER: other}
+            self.post(chat(user("a"), model="ok"))
+            self.post(chat(user("b"), model="ok"), header)
+            text = self.answer(chat(user("c"), model="stats"), header)
+
+            self.assertEqual(sorted(p.name for p in self.dump_dir.iterdir()), ["0001-prompt.json"])
+            self.assertEqual(
+                sorted(p.name for p in Path(other).iterdir()),
+                ["0001-prompt.json", "0002-prompt.json"],
+            )
+            self.assertTrue(text.endswith(f"\n\nsaved as {Path(other) / '0002-prompt.json'}"))
+
+    def test_dump_dir_header_naming_the_default(self) -> None:
+        self.post(chat(user("a"), model="ok"))
+        self.post(chat(user("b"), model="ok"), {fake.DUMP_DIR_HEADER: str(self.dump_dir)})
+        self.post(chat(user("c"), model="ok"))
+        self.assertEqual(
+            sorted(p.name for p in self.dump_dir.iterdir()),
+            ["0001-prompt.json", "0002-prompt.json", "0003-prompt.json"],
+        )
+
+    def test_dump_dir_must_be_absolute(self) -> None:
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self.post(chat(user("a")), {fake.DUMP_DIR_HEADER: "relative"})
+        self.assertEqual(caught.exception.code, 400)
+        self.assertIn("absolute path", caught.exception.read().decode())
+
+    def test_stats_without_dump_has_no_footer(self) -> None:
+        server = fake.make_server("127.0.0.1", 0, None)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.url = f"http://127.0.0.1:{server.server_address[1]}/v1"
+        self.assertNotIn("saved as", self.answer(chat(user("a"), model="stats")))
+
     def test_models(self) -> None:
         with urllib.request.urlopen(self.url + "/models") as response:
             ids = [m["id"] for m in json.load(response)["data"]]
+            server = response.headers["Server"]
         self.assertEqual(ids, list(fake.MODELS))
+        self.assertTrue(server.startswith(f"openai-fake-provider/{fake.__version__} "))
+
+    def test_serve_on_a_used_port(self) -> None:
+        port = str(self.server.server_address[1])
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            self.assertEqual(fake.main(["serve", "--port", port]), 1)
+        self.assertEqual(stderr.getvalue(), f"127.0.0.1:{port} is already in use\n")
 
 
 if __name__ == "__main__":

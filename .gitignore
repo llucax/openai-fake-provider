@@ -3,3 +3,4 @@ __pycache__/
 /dist/
 *.egg-info/
 /requests/
+node_modules/
